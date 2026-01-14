@@ -1,0 +1,16 @@
+# GUI 框架
+PyQt6==6.7.1
+
+# PDF/OFD 处理与渲染
+PyMuPDF==1.24.10
+
+# PDF 文本深度解析 (新增)
+pdfplumber==0.11.0
+
+# 数据处理与 Excel 导出 (新增)
+pandas==2.2.2
+openpyxl==3.1.2
+
+# 基础打包支持
+pyinstaller==6.6.0
+setuptools
