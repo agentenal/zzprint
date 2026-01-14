@@ -130,7 +130,7 @@ class ZZPrinterApp(QMainWindow):
         super().__init__()
         self.engine = PrintingEngine()
         self.settings = QSettings("ZZStudio", "ZZPrinter")
-        self.setWindowTitle("ZZ打票 - 3.2 Pro 金额增强版")
+        self.setWindowTitle("ZZ打票 - 3.2  by Agentenal")
         self.setMinimumSize(1200, 900)
         self.setAcceptDrops(True)
         
@@ -224,7 +224,7 @@ class ZZPrinterApp(QMainWindow):
         content_layout = QVBoxLayout()
         top_split = QHBoxLayout()
         self.file_list = QListWidget(); self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        v1 = QVBoxLayout(); v1.addWidget(QLabel("<b>发票队列</b>")); v1.addWidget(self.file_list)
+        v1 = QVBoxLayout(); v1.addWidget(QLabel("<b>发票队列，支持拖拽导入</b>")); v1.addWidget(self.file_list)
         top_split.addLayout(v1, 1)
 
         self.preview_label = QLabel("预览区"); self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
