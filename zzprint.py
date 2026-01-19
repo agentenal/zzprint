@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QMessageBox, QScrollArea, QAbstractItemView,
                              QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit)
 from PyQt6.QtCore import Qt, QSettings
-from PyQt6.QtGui import QImage, QPixmap, QColor, QKeySequence
+from PyQt6.QtGui import QImage, QPixmap, QColor, QKeySequence, QFont
 
 # --- 核心处理引擎 ---
 class PrintingEngine:
@@ -30,33 +30,29 @@ class PrintingEngine:
             try:
                 with open(self.ledger_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    # 数据结构兼容性补丁
-                    for key in data:
-                        if "items" not in data[key]:
-                            data[key]["items"] = [{
-                                "项目名称": data[key].get("项目名称", "未知"),
-                                "规格型号": data[key].get("规格型号", "无"),
-                                "单位": data[key].get("单位", "无"),
-                                "数量": data[key].get("数量", "0"),
-                                "单价": data[key].get("单价", "0"),
-                                "金额": data[key].get("金额", "0.00"),
-                                "税率": data[key].get("税率", "0%"),
-                                "税额": data[key].get("税额", "0.00"),
-                                "合计": data[key].get("合计", "0.00")
-                            }]
-                        if "处理日期" not in data[key]:
-                            data[key]["处理日期"] = "未知"
                     return data
             except: return {}
         return {}
 
     def save_ledger(self, info):
         if info["发票号码"] != "未知":
-            # 更新处理日期：同一张票多次打印，只保留最后一次打印的时间
-            info["处理日期"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            # 记录打印日期，格式 yyyy/mm/dd HH:MM
+            info["打印日期"] = datetime.datetime.now().strftime("%Y/%m/%d %H:%M")
             self.ledger[info["发票号码"]] = info
             with open(self.ledger_file, 'w', encoding='utf-8') as f:
                 json.dump(self.ledger, f, ensure_ascii=False, indent=4)
+
+    def normalize_date(self, date_str):
+        """ 将各种日期格式统一为 yyyy/mm/dd """
+        if not date_str or date_str == "未知": return "未知"
+        try:
+            # 清理中文和符号
+            clean_str = date_str.replace("年", "/").replace("月", "/").replace("日", "").strip()
+            # 尝试解析
+            dt = datetime.datetime.strptime(clean_str, "%Y/%m/%d")
+            return dt.strftime("%Y/%m/%d")
+        except:
+            return date_str
 
     def parse_invoice(self, file_path):
         base_info = {
@@ -64,53 +60,89 @@ class PrintingEngine:
             "购买方名称": "未知", "购买方税号": "未知",
             "销售方名称": "未知", "销售方税号": "未知",
             "备注": "无", "文件名": os.path.basename(file_path),
-            "处理日期": "待处理",
+            "打印日期": "待处理",
             "items": []
         }
         try:
             with pdfplumber.open(file_path) as pdf:
-                text = pdf.pages[0].extract_text()
+                page = pdf.pages[0]
+                text = page.extract_text()
                 lines = text.split('\n')
                 
+                # 1. 基础信息正则提取
                 m_no = re.search(r'发票号码[:：]\s*(\d+)', text)
                 if m_no: base_info["发票号码"] = m_no.group(1)
                 
                 m_date = re.search(r'开票日期[:：]\s*(\d{4}年\d{1,2}月\d{1,2}日)', text)
-                if m_date: base_info["开票日期"] = m_date.group(1)
+                if m_date: base_info["开票日期"] = self.normalize_date(m_date.group(1))
                 
-                if "自产农产品销售" in text: base_info["自产农产品销售"] = "是"
+                # 特殊标记识别
+                if "自产农产品" in text or "自产农产品销售" in text: 
+                    base_info["自产农产品销售"] = "是"
 
                 names = re.findall(r'名称[:：]\s*([^\n\s]+)', text)
                 ids = re.findall(r'纳税人识别号[:：]\s*([A-Z0-9]+)', text)
                 if len(names) >= 2: base_info["购买方名称"], base_info["销售方名称"] = names[0], names[1]
                 if len(ids) >= 2: base_info["购买方税号"], base_info["销售方税号"] = ids[0], ids[1]
 
+                # 2. 明细行提取 (增强版)
                 for line in lines:
-                    if '*' in line and any(c.isdigit() for c in line):
+                    if any(c.isdigit() for c in line) and ('*' in line or '免税' in line or '.' in line):
                         parts = line.split()
-                        if len(parts) >= 6:
-                            try:
-                                amt_str = parts[-3].replace(',', '').replace('￥','').replace('¥','')
-                                tax_str = parts[-1].replace(',', '')
-                                amt = float(amt_str)
-                                tax = 0.00 if '***' in tax_str or '免税' in parts[-2] else float(tax_str)
-                                base_info["items"].append({
-                                    "项目名称": parts[0],
-                                    "规格型号": parts[1] if len(parts) >= 8 else "无",
-                                    "单位": parts[2] if len(parts) >= 8 else (parts[1] if len(parts) == 7 else "无"),
-                                    "数量": parts[-5], "单价": parts[-4],
-                                    "金额": f"{amt:.2f}", "税率": parts[-2],
-                                    "税额": f"{tax:.2f}", "合计": f"{(amt + tax):.2f}"
-                                })
-                            except: pass
+                        if len(parts) < 5: continue 
+                        
+                        try:
+                            # 倒序取值策略
+                            tax_amt_str = parts[-1] 
+                            tax_rate_str = parts[-2]
+                            amt_str = parts[-3]
+                            
+                            tax_amt = 0.00
+                            if '***' in tax_amt_str: tax_amt = 0.00
+                            else: tax_amt = float(tax_amt_str.replace('￥','').replace(',',''))
+                            
+                            amt = float(amt_str.replace('￥','').replace(',',''))
+                            
+                            qty = "1"
+                            unit = "无"
+                            price = str(amt)
+                            
+                            if len(parts) >= 6:
+                                try:
+                                    if self.is_float(parts[-4]) and self.is_float(parts[-5]):
+                                        price = parts[-4]
+                                        qty = parts[-5]
+                                        unit = parts[-6] if not self.is_float(parts[-6]) else "无"
+                                except: pass
+
+                            base_info["items"].append({
+                                "项目名称": parts[0],
+                                "规格型号": "无",
+                                "单位": unit,
+                                "数量": qty, 
+                                "单价": price,
+                                "金额": f"{amt:.2f}", 
+                                "税率": tax_rate_str,
+                                "税额": f"{tax_amt:.2f}", 
+                                "合计": f"{(amt + tax_amt):.2f}"
+                            })
+                        except: 
+                            continue
                 
                 if not base_info["items"]:
                     total_m = re.search(r'[（\(]小写[）\)]\s*[￥¥]?\s*([\d\.]+)', text)
                     if total_m:
-                        val = total_m.group(1)
-                        base_info["items"].append({"项目名称": "总计", "数量": "1", "金额": val, "税额": "0.00", "合计": val})
+                        val = float(total_m.group(1))
+                        base_info["items"].append({
+                            "项目名称": "（总额识别）", "数量": "1", "单价": val, 
+                            "金额": f"{val:.2f}", "税率": "-", "税额": "0.00", "合计": f"{val:.2f}"
+                        })
         except: pass
         return base_info
+
+    def is_float(self, s):
+        try: float(s.replace(',','')); return True
+        except: return False
 
     def create_layout(self, input_files, layout_desc, output_path, copies=1):
         a4_w, a4_h = 595, 842 
@@ -131,6 +163,7 @@ class PrintingEngine:
                 except: pass
         doc.save(output_path); doc.close()
 
+# --- 增强型表格控件（支持复制） ---
 class CopyableTable(QTableWidget):
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.StandardKey.Copy):
@@ -148,18 +181,24 @@ class CopyableTable(QTableWidget):
             QApplication.clipboard().setText(table_text)
         else: super().keyPressEvent(event)
 
+# --- 主程序界面 ---
 class ZZPrinterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.engine = PrintingEngine()
-        self.settings = QSettings("ZZStudio", "ZZPrinter")
-        self.setWindowTitle("ZZ打票大叔捣腾版 - 3.5 by agentenal")
-        self.setMinimumSize(1260, 850)
+        self.settings = QSettings("ZZStudio", "ZZPrinterV2")
+        self.setWindowTitle("ZZ打票助手 - 专业增强版")
+        self.setMinimumSize(1280, 850)
         self.setAcceptDrops(True)
         
+        # 状态变量
         self.group_stat_active = False
         self.summary_level = 1
-        self.theme_mode = self.settings.value("theme", "dark")
+        self.theme_mode = self.settings.value("theme", "light") 
+        
+        # 排序状态
+        self.sort_col = "打印日期" 
+        self.sort_asc = False 
 
         self.init_ui()
         self.apply_theme() 
@@ -168,232 +207,445 @@ class ZZPrinterApp(QMainWindow):
     def init_ui(self):
         central_widget = QWidget(); self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
 
-        # --- 左侧控制面板 ---
-        side_scroll = QScrollArea(); side_scroll.setFixedWidth(290); side_scroll.setWidgetResizable(True)
+        # === 左侧控制面板 ===
+        side_scroll = QScrollArea()
+        side_scroll.setFixedWidth(300)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        
         side_content = QFrame(); side_content.setObjectName("SidePanel")
         side_layout = QVBoxLayout(side_content)
+        side_layout.setSpacing(12)
+        side_layout.setContentsMargins(15, 20, 15, 20)
         
+        # 标题栏
         header_layout = QHBoxLayout()
-        header_layout.addWidget(QLabel("<h2 style='color:#007AFF;'>ZZ 打票</h2>"))
-        self.btn_theme = QPushButton(f"🌓 {self.theme_mode.upper()}"); self.btn_theme.setFixedWidth(80)
+        title_label = QLabel("ZZ 打票助手")
+        title_label.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
+        header_layout.addWidget(title_label)
+        self.btn_theme = QPushButton("🌓"); self.btn_theme.setFixedWidth(40)
         self.btn_theme.clicked.connect(self.toggle_theme); header_layout.addWidget(self.btn_theme)
         side_layout.addLayout(header_layout)
         
-        for txt, func in [("添加发票文件", self.add_files), ("从文件夹导入", self.add_folder), ("移除选中文件", self.remove_selected)]:
-            btn = QPushButton(txt); btn.clicked.connect(func); side_layout.addWidget(btn)
+        # 文件操作区
+        side_layout.addWidget(QLabel("📂 文件管理"))
+        btn_add_file = self.create_btn("添加发票文件", self.add_files, "#007AFF")
+        btn_add_dir = self.create_btn("从文件夹导入", self.add_folder, "#5856D6")
+        btn_rm_sel = self.create_btn("移除选中文件", self.remove_selected, "#FF9500")
         
-        self.btn_remove_dup = QPushButton("一键移除已打印"); self.btn_remove_dup.setEnabled(False)
-        self.btn_remove_dup.clicked.connect(self.remove_duplicates); side_layout.addWidget(self.btn_remove_dup)
+        self.btn_remove_dup = self.create_btn("一键移除已打印", self.remove_duplicates, "#FF3B30")
+        self.btn_remove_dup.setEnabled(False)
+        
+        side_layout.addWidget(btn_add_file)
+        side_layout.addWidget(btn_add_dir)
+        side_layout.addWidget(btn_rm_sel)
+        side_layout.addWidget(self.btn_remove_dup)
 
-        btn_excel = QPushButton("导出 Excel 台账"); btn_excel.setStyleSheet("background-color: #34C759; color: white;")
-        btn_excel.clicked.connect(self.export_excel); side_layout.addWidget(btn_excel)
-        btn_clear = QPushButton("清空队列"); btn_clear.clicked.connect(self.clear_all); side_layout.addWidget(btn_clear)
+        side_layout.addWidget(self.create_line())
 
-        side_layout.addSpacing(15)
+        # 打印设置区
+        side_layout.addWidget(QLabel("🖨️ 打印设置"))
         self.mode_combo = QComboBox(); self.mode_combo.addItems(["直接打印", "打印为PDF"])
-        side_layout.addWidget(QLabel("打印模式:")); side_layout.addWidget(self.mode_combo)
+        self.mode_combo.setFixedHeight(35)
+        side_layout.addWidget(QLabel("输出模式:"))
+        side_layout.addWidget(self.mode_combo)
+        
         self.layout_combo = QComboBox(); self.layout_combo.addItems(["1×1", "1×2", "1×3", "2×2", "2×3", "2×4"])
+        self.layout_combo.setFixedHeight(35)
         self.layout_combo.currentTextChanged.connect(self.update_preview)
-        side_layout.addWidget(QLabel("页面布局:")); side_layout.addWidget(self.layout_combo)
-        self.copy_spin = QSpinBox(); self.copy_spin.setRange(1, 4); self.copy_spin.setValue(1)
-        side_layout.addWidget(QLabel("单张打印份数:")); side_layout.addWidget(self.copy_spin)
+        side_layout.addWidget(QLabel("页面布局:"))
+        side_layout.addWidget(self.layout_combo)
+        
+        self.copy_spin = QSpinBox(); self.copy_spin.setRange(1, 10); self.copy_spin.setValue(1)
+        self.copy_spin.setFixedHeight(35)
+        side_layout.addWidget(QLabel("单张份数:"))
+        side_layout.addWidget(self.copy_spin)
+
+        side_layout.addWidget(self.create_line())
+
+        # 数据操作区
+        side_layout.addWidget(QLabel("📊 数据台账"))
+        btn_excel = self.create_btn("导出 Excel 台账", self.export_excel, "#34C759")
+        btn_clear = self.create_btn("清空打印队列", self.clear_all, "#8E8E93")
+        side_layout.addWidget(btn_excel)
+        side_layout.addWidget(btn_clear)
 
         side_layout.addStretch()
-        self.log_area = QTextEdit(); self.log_area.setFixedHeight(60); self.log_area.setReadOnly(True); side_layout.addWidget(self.log_area)
-        self.btn_print = QPushButton("开始处理 / 打印"); self.btn_print.setFixedHeight(45); self.btn_print.clicked.connect(self.process_printing)
+        
+        # 底部操作
+        self.btn_print = QPushButton("🚀 开始处理 / 打印")
+        self.btn_print.setFixedHeight(50)
+        self.btn_print.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+        self.btn_print.clicked.connect(self.process_printing)
         side_layout.addWidget(self.btn_print)
-        btn_quit = QPushButton("退出程序"); btn_quit.setObjectName("QuitBtn"); btn_quit.clicked.connect(self.close); side_layout.addWidget(btn_quit)
+        
+        btn_quit = QPushButton("退出程序"); btn_quit.setObjectName("QuitBtn")
+        btn_quit.setFixedHeight(35)
+        btn_quit.clicked.connect(self.close); side_layout.addWidget(btn_quit)
+
         side_scroll.setWidget(side_content); main_layout.addWidget(side_scroll)
 
-        # --- 右侧内容区 ---
+        # === 右侧内容区 ===
         content_layout = QVBoxLayout()
+        
         top_split = QHBoxLayout()
         self.file_list = QListWidget(); self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        v1 = QVBoxLayout(); v1.addWidget(QLabel("<b>待打印队列</b>")); v1.addWidget(self.file_list); top_split.addLayout(v1, 1)
+        v1 = QVBoxLayout(); v1.addWidget(QLabel("<b>📄 待打印队列</b>")); v1.addWidget(self.file_list); top_split.addLayout(v1, 4)
+        
         self.preview_label = QLabel("预览区"); self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll_area = QScrollArea(); self.scroll_area.setWidget(self.preview_label); self.scroll_area.setWidgetResizable(True)
-        v2 = QVBoxLayout(); v2.addWidget(QLabel("<b>实时预览</b>")); v2.addWidget(self.scroll_area); top_split.addLayout(v2, 1)
-        content_layout.addLayout(top_split, 2)
+        v2 = QVBoxLayout(); v2.addWidget(QLabel("<b>👁️ 实时预览</b>")); v2.addWidget(self.scroll_area); top_split.addLayout(v2, 3)
+        content_layout.addLayout(top_split, 3)
 
-        # --- 增强型筛选工具栏 ---
-        filter_box = QFrame(); filter_box.setFixedHeight(45)
-        filter_layout = QHBoxLayout(filter_box); filter_layout.setContentsMargins(0,0,0,0)
-        filter_layout.addWidget(QLabel("<b>销售方:</b>"))
-        self.search_seller = QLineEdit(); self.search_seller.setPlaceholderText("关键词...")
-        self.search_seller.textChanged.connect(self.refresh_table); filter_layout.addWidget(self.search_seller, 1)
+        # 筛选栏
+        filter_box = QFrame(); filter_box.setObjectName("FilterBox")
+        filter_box.setFixedHeight(50)
+        filter_layout = QHBoxLayout(filter_box)
+        filter_layout.setContentsMargins(10, 5, 10, 5)
+
+        self.search_seller = QLineEdit(); self.search_seller.setPlaceholderText("🔍 筛选销售方...")
+        self.search_seller.textChanged.connect(self.refresh_table); filter_layout.addWidget(self.search_seller, 2)
         
-        filter_layout.addWidget(QLabel("<b>开票日期:</b>"))
-        self.search_date = QLineEdit(); self.search_date.setPlaceholderText("2026-01"); self.search_date.setFixedWidth(80)
-        self.search_date.textChanged.connect(self.refresh_table); filter_layout.addWidget(self.search_date)
+        self.search_date = QLineEdit(); self.search_date.setPlaceholderText("📅 开票年月(202601)")
+        self.search_date.textChanged.connect(self.refresh_table); filter_layout.addWidget(self.search_date, 1)
 
-        filter_layout.addWidget(QLabel("<b>处理日期:</b>"))
-        self.search_proc_date = QLineEdit(); self.search_proc_date.setPlaceholderText("天 或 区间(至)"); self.search_proc_date.setFixedWidth(140)
-        self.search_proc_date.textChanged.connect(self.refresh_table); filter_layout.addWidget(self.search_proc_date)
+        filter_layout.addWidget(QLabel("|"))
 
-        self.btn_group_stat = QPushButton("📊 分组: 关"); self.btn_group_stat.setCheckable(True)
+        self.btn_group_stat = QPushButton("📊 分组统计: 关"); self.btn_group_stat.setCheckable(True)
         self.btn_group_stat.clicked.connect(self.toggle_group_stat); filter_layout.addWidget(self.btn_group_stat)
-        self.btn_sum_level = QPushButton("汇总: 一级"); self.btn_sum_level.clicked.connect(self.toggle_sum_level)
+        
+        self.btn_sum_level = QPushButton("📑 汇总: 一级"); self.btn_sum_level.clicked.connect(self.toggle_sum_level)
+        self.btn_sum_level.setEnabled(False) 
         filter_layout.addWidget(self.btn_sum_level)
-        btn_reset = QPushButton("重置"); btn_reset.clicked.connect(self.reset_filters); filter_layout.addWidget(btn_reset)
+        
+        btn_reset = QPushButton("重置条件"); btn_reset.clicked.connect(self.reset_filters)
+        filter_layout.addWidget(btn_reset)
+        
         content_layout.addWidget(filter_box)
 
+        # 表格
         self.table = CopyableTable()
-        headers = ["发票号码", "开票日期", "处理日期", "销售方", "明细项目", "数量", "税额", "金额", "价税合计"]
-        self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        content_layout.addWidget(self.table, 1)
+        self.cols = ["发票号码", "开票日期", "打印日期", "销售方名称", "自产农产品", "项目名称", "数量", "单价", "金额", "税率", "税额", "价税合计"]
+        self.table.setColumnCount(len(self.cols)); self.table.setHorizontalHeaderLabels(self.cols)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().sectionClicked.connect(self.handle_header_click) 
+        
+        self.table.setColumnWidth(0, 120) 
+        self.table.setColumnWidth(3, 180) 
+        content_layout.addWidget(self.table, 4)
+        
         main_layout.addLayout(content_layout)
+
+    def create_btn(self, text, func, color_hex):
+        btn = QPushButton(text)
+        btn.clicked.connect(func)
+        btn.setProperty("base_color", color_hex)
+        return btn
+
+    def create_line(self):
+        line = QFrame(); line.setFrameShape(QFrame.Shape.HLine); line.setFrameShadow(QFrame.Shadow.Sunken)
+        return line
+
+    # --- 逻辑控制 ---
 
     def toggle_theme(self):
         self.theme_mode = "light" if self.theme_mode == "dark" else "dark"
-        self.settings.setValue("theme", self.theme_mode); self.btn_theme.setText(f"🌓 {self.theme_mode.upper()}"); self.apply_theme()
+        self.settings.setValue("theme", self.theme_mode)
+        self.apply_theme()
+
     def toggle_group_stat(self):
         self.group_stat_active = self.btn_group_stat.isChecked()
-        self.btn_group_stat.setText("📊 分组: 开" if self.group_stat_active else "📊 分组: 关"); self.refresh_table()
+        self.btn_group_stat.setText("📊 分组统计: 开" if self.group_stat_active else "📊 分组统计: 关")
+        self.btn_sum_level.setEnabled(self.group_stat_active)
+        self.refresh_table()
+
     def toggle_sum_level(self):
         self.summary_level = 2 if self.summary_level == 1 else 1
-        self.btn_sum_level.setText("汇总: 一级" if self.summary_level == 1 else "汇总: 二级")
+        self.btn_sum_level.setText("📑 汇总: 二级" if self.summary_level == 2 else "📑 汇总: 一级")
         if self.group_stat_active: self.refresh_table()
 
-    def get_filtered_raw_list(self):
-        """ 获取满足筛选条件的原始发票基础信息列表 """
+    def handle_header_click(self, index):
+        if self.group_stat_active:
+            QMessageBox.information(self, "提示", "分组模式下按销售方+日期固定排序。")
+            return
+
+        col_name = self.cols[index]
+        if self.sort_col == col_name:
+            self.sort_asc = not self.sort_asc
+        else:
+            self.sort_col = col_name
+            self.sort_asc = True 
+            
+        for i in range(self.table.columnCount()):
+            item = self.table.horizontalHeaderItem(i)
+            txt = self.cols[i]
+            if txt == self.sort_col:
+                item.setText(f"{txt} {'↑' if self.sort_asc else '↓'}")
+            else:
+                item.setText(txt)
+        
+        self.refresh_table()
+
+    def get_data_frame(self):
         seller_key = self.search_seller.text().strip().lower()
         date_key = self.search_date.text().strip().replace("-", "").replace("年","").replace("月","")
-        proc_date_key = self.search_proc_date.text().strip()
         
-        results = []
+        raw_list = []
         for no, base in self.engine.ledger.items():
-            # 开票日期和销售方匹配
-            if seller_key in base.get("销售方名称", "").lower() and date_key in base.get("开票日期", "").replace("年","").replace("月",""):
-                
-                # 处理日期筛选
-                p_date = base.get("处理日期", "未知")
-                match_proc = True
-                if proc_date_key:
-                    if "至" in proc_date_key:
-                        try:
-                            start_s, end_s = proc_date_key.split("至")
-                            cur_d = p_date.split(" ")[0]
-                            match_proc = (start_s.strip() <= cur_d <= end_s.strip())
-                        except: match_proc = False
-                    else:
-                        match_proc = (proc_date_key in p_date)
-                
-                if match_proc:
-                    results.append(base)
-        return results
+            s_name = base.get("销售方名称", "").lower()
+            d_date = base.get("开票日期", "").replace("/", "").replace("-","")
+            
+            if seller_key in s_name and date_key in d_date:
+                for item in base.get("items", []):
+                    row = base.copy()
+                    del row["items"] 
+                    row.update(item) 
+                    try: row["金额"] = float(row["金额"])
+                    except: row["金额"] = 0.0
+                    try: row["税额"] = float(row["税额"])
+                    except: row["税额"] = 0.0
+                    try: row["合计"] = float(row["合计"])
+                    except: row["合计"] = 0.0
+                    
+                    row["价税合计"] = row["合计"]
+                    raw_list.append(row)
+        
+        return pd.DataFrame(raw_list)
 
     def refresh_table(self):
         self.table.setRowCount(0)
-        filtered_bases = self.get_filtered_raw_list()
-        
-        flat_data = []
-        for base in filtered_bases:
-            for item in base.get("items", []):
-                flat_data.append({**base, **item})
-        
-        if not flat_data: return
-        df = pd.DataFrame(flat_data)
-        for col in ['合计', '金额', '税额']: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        df = self.get_data_frame()
+        if df.empty: return
 
-        if not self.group_stat_active: 
-            self._fill_table_rows(df.to_dict('records'))
+        if not self.group_stat_active:
+            if self.sort_col in df.columns:
+                df = df.sort_values(by=self.sort_col, ascending=self.sort_asc)
+            self._fill_rows_from_df(df)
+            
         else:
-            if self.summary_level == 1:
-                for seller, g_s in df.groupby('销售方名称', sort=False):
-                    self._fill_table_rows(g_s.to_dict('records'))
-                    self._add_summary_row(f"【{seller}】小计", g_s['税额'].sum(), g_s['金额'].sum(), g_s['合计'].sum(), QColor("#E1F5FE" if self.theme_mode == "light" else "#01579B"))
-            else:
-                for (seller, inv_no), g_inv in df.groupby(['销售方名称', '发票号码'], sort=False):
-                    self._fill_table_rows(g_inv.to_dict('records'))
-                    self._add_summary_row(f"票号 {inv_no} 小计", g_inv['税额'].sum(), g_inv['金额'].sum(), g_inv['合计'].sum(), QColor("#F1F8E9" if self.theme_mode == "light" else "#1B5E20"))
+            bg_l1 = QColor("#E3F2FD") if self.theme_mode == "light" else QColor("#0D47A1") # 销售方小计
+            bg_l2 = QColor("#F1F8E9") if self.theme_mode == "light" else QColor("#1B5E20") # 日期小计
+            
+            # 按销售方（字母顺序） + 打印日期（倒序，最近的日期在前）进行排序
+            df = df.sort_values(by=["销售方名称", "打印日期"], ascending=[True, False])
+            
+            grouped_seller = df.groupby("销售方名称", sort=False)
+            
+            for seller_name, group_df in grouped_seller:
+                
+                # --- 一级汇总 ---
+                if self.summary_level == 1:
+                    self._fill_rows_from_df(group_df)
+                    self._insert_sum_row(f"【{seller_name}】 总计", group_df, bg_l1)
+                
+                # --- 二级汇总 (按打印日期) ---
+                else:
+                    # 创建一个临时列用于按“天”分组（忽略时分秒）
+                    # 使用 .copy() 防止 SettingWithCopyWarning
+                    group_df_c = group_df.copy()
+                    group_df_c["_day_group"] = group_df_c["打印日期"].apply(lambda x: str(x).split(" ")[0])
+                    
+                    # 按天分组
+                    grouped_date = group_df_c.groupby("_day_group", sort=False)
+                    
+                    for date_val, date_df in grouped_date:
+                        self._fill_rows_from_df(date_df)
+                        # 插入日期小计
+                        self._insert_sum_row(f"  └─ 日期 {date_val} 小计", date_df, bg_l2)
+                    
+                    # 最后插入销售方总计
+                    self._insert_sum_row(f"【{seller_name}】 总计", group_df, bg_l1)
 
-    def _fill_table_rows(self, rows):
-        for r_data in rows:
-            r = self.table.rowCount(); self.table.insertRow(r)
-            vals = [r_data["发票号码"], r_data["开票日期"], r_data.get("处理日期","未知"), r_data["销售方名称"], r_data["项目名称"], r_data["数量"], f"{r_data['税额']:.2f}", f"{r_data['金额']:.2f}", f"{r_data['合计']:.2f}"]
-            for i, v in enumerate(vals): self.table.setItem(r, i, QTableWidgetItem(str(v)))
+    def _fill_rows_from_df(self, df):
+        for _, row_data in df.iterrows():
+            r = self.table.rowCount()
+            self.table.insertRow(r)
+            for i, col_key in enumerate(self.cols):
+                val = row_data.get(col_key, "")
+                if isinstance(val, float): val = f"{val:.2f}"
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, i, item)
 
-    def _add_summary_row(self, label, tax, amt, total, color):
-        r = self.table.rowCount(); self.table.insertRow(r)
-        sum_item = QTableWidgetItem(label); sum_item.setBackground(color)
-        self.table.setItem(r, 3, sum_item)
-        for i, val in [(6, tax), (7, amt), (8, total)]:
-            ti = QTableWidgetItem(f"{val:.2f}"); ti.setBackground(color); ti.setForeground(QColor("#FF9500"))
-            self.table.setItem(r, i, ti)
+    def _insert_sum_row(self, label, df_scope, bg_color):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        
+        label_item = QTableWidgetItem(label)
+        label_item.setBackground(bg_color)
+        label_item.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
+        self.table.setItem(r, 3, label_item) 
+        
+        sum_cols = {"金额": 8, "税额": 10, "价税合计": 11}
+        for col_name, col_idx in sum_cols.items():
+            val = df_scope[col_name].sum()
+            item = QTableWidgetItem(f"{val:.2f}")
+            item.setBackground(bg_color)
+            item.setForeground(QColor("#D32F2F") if self.theme_mode == "light" else QColor("#FF6659"))
+            item.setFont(QFont("Microsoft YaHei", 9, QFont.Weight.Bold))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(r, col_idx, item)
+            
+        for i in range(self.table.columnCount()):
+            if self.table.item(r, i) is None:
+                empty = QTableWidgetItem("")
+                empty.setBackground(bg_color)
+                self.table.setItem(r, i, empty)
 
     def export_excel(self):
-        """ 导出台账：彻底展平明细，每个字段独立一列 """
-        filtered_bases = self.get_filtered_raw_list()
-        if not filtered_bases:
+        df = self.get_data_frame()
+        if df.empty:
             QMessageBox.warning(self, "提示", "没有数据可导出！")
             return
-
-        # 定义 Excel 列顺序
-        col_order = [
-            "发票号码", "开票日期", "处理日期", "销售方名称", "销售方税号", "自产农产品销售",
-            "项目名称", "规格型号", "单位", "数量", "单价", "金额", "税率", "税额", "合计",
-            "购买方名称", "购买方税号", "备注"
-        ]
-
+        
         p, _ = QFileDialog.getSaveFileName(self, "保存台账", f"发票台账_{datetime.datetime.now().strftime('%Y%m%d')}.xlsx", "*.xlsx")
         if p:
             try:
-                # 核心逻辑：循环发票 -> 循环明细 -> 每一行明细生成一个 DataFrame 行
-                export_data = []
-                for base in filtered_bases:
-                    items = base.get("items", [])
-                    for item in items:
-                        # 合并基础字段和明细字段
-                        row = {**base, **item}
-                        export_data.append(row)
-                
-                df = pd.DataFrame(export_data)
-                # 补全可能缺失的列
-                for c in col_order:
+                export_cols = ["发票号码", "打印日期", "开票日期", "销售方名称", "销售方税号", "购买方名称", 
+                               "自产农产品销售", "项目名称", "规格型号", "单位", "数量", "单价", 
+                               "金额", "税率", "税额", "价税合计", "备注", "文件名"]
+                for c in export_cols:
                     if c not in df.columns: df[c] = ""
-                
-                # 按照指定顺序导出，并排除掉 items 列表原文列
-                df[col_order].to_excel(p, index=False)
-                self.log_area.append(f"导出成功！共 {len(export_data)} 行明细。")
-                # os.startfile(os.path.dirname(p)) 默认导出后不打开文件夹
+                df[export_cols].to_excel(p, index=False)
+                QMessageBox.information(self, "成功", "导出成功！")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"导出失败: {str(e)}")
 
     def process_printing(self):
         paths = [self.file_list.item(i).text() for i in range(self.file_list.count())]
         if not paths: return
-        out = "print_task.pdf"
-        self.engine.create_layout(paths, self.layout_combo.currentText(), out, self.copy_spin.value())
-        save_p, _ = QFileDialog.getSaveFileName(self, "保存打印文件", "", "*.pdf")
-        if save_p:
-            shutil.move(out, save_p)
-            # 处理每一张发票并记录时间
-            for i in range(self.file_list.count()): 
-                info = self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
-                self.engine.save_ledger(info)
-            self.refresh_table(); os.startfile(save_p)
+        
+        mode = self.mode_combo.currentText()
+        out_file = "temp_print_task.pdf"
+        
+        self.engine.create_layout(paths, self.layout_combo.currentText(), out_file, self.copy_spin.value())
+        
+        if mode == "打印为PDF":
+            save_p, _ = QFileDialog.getSaveFileName(self, "保存打印文件", f"打印任务_{datetime.datetime.now().strftime('%H%M%S')}.pdf", "*.pdf")
+            if save_p:
+                shutil.move(out_file, save_p)
+                self._mark_as_printed()
+                os.startfile(save_p)
+        else:
+            QMessageBox.information(self, "提示", "已生成打印文件，将打开预览，请在打开的窗口中点击打印。")
+            self._mark_as_printed()
+            os.startfile(out_file)
+            
+    def _mark_as_printed(self):
+        for i in range(self.file_list.count()): 
+            info = self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
+            self.engine.save_ledger(info)
+        self.refresh_table()
 
     def remove_duplicates(self):
         for i in range(self.file_list.count() - 1, -1, -1):
-            if self.file_list.item(i).data(Qt.ItemDataRole.UserRole)["发票号码"] in self.engine.ledger: self.file_list.takeItem(i)
-        self.btn_remove_dup.setEnabled(False); self.update_preview()
+            if self.file_list.item(i).data(Qt.ItemDataRole.UserRole)["发票号码"] in self.engine.ledger:
+                self.file_list.takeItem(i)
+        self.btn_remove_dup.setEnabled(False)
+        self.update_preview()
 
     def handle_files(self, paths):
         has_dup = False
         for p in paths:
             if p.lower().endswith(('.pdf', '.ofd')):
-                info = self.engine.parse_invoice(p); self.file_list.addItem(p)
-                self.file_list.item(self.file_list.count()-1).setData(Qt.ItemDataRole.UserRole, info)
+                info = self.engine.parse_invoice(p)
+                list_item = QListWidget() 
+                self.file_list.addItem(p)
+                row = self.file_list.count() - 1
+                self.file_list.item(row).setData(Qt.ItemDataRole.UserRole, info)
+                
                 if info["发票号码"] in self.engine.ledger:
-                    self.file_list.item(self.file_list.count()-1).setForeground(QColor("#FF3B30")); has_dup = True
-        self.btn_remove_dup.setEnabled(has_dup); self.update_preview()
+                    self.file_list.item(row).setForeground(QColor("#FF3B30"))
+                    self.file_list.item(row).setToolTip("该发票已打印过！")
+                    has_dup = True
+                else:
+                    self.file_list.item(row).setToolTip(f"发票号: {info['发票号码']}")
+
+        if has_dup: self.btn_remove_dup.setEnabled(True)
+        self.update_preview()
 
     def apply_theme(self):
-        dark = self.theme_mode == "dark"
-        cfg = {"bg": "#1C1C1E" if dark else "#F2F2F7", "panel": "#2C2C2E" if dark else "#FFFFFF", "text": "#FFFFFF" if dark else "#1C1C1E", "border": "#3A3A3C" if dark else "#D1D1D6"}
-        self.setStyleSheet(f"QMainWindow, QScrollArea {{ background: {cfg['bg']}; }} QFrame#SidePanel {{ background: {cfg['panel']}; border-radius: 12px; margin: 5px; }} QLabel {{ color: {cfg['text']}; }} QPushButton {{ background: #007AFF; color: white; border-radius: 8px; padding: 6px; border:none; }} QTableWidget {{ background: {cfg['panel']}; color: {cfg['text']}; border: 1px solid {cfg['border']}; }} QPushButton#QuitBtn {{ background: #FF3B30; }}")
+        is_dark = self.theme_mode == "dark"
+        
+        c = {
+            "bg": "#1E1E1E" if is_dark else "#F5F5F7",
+            "panel": "#2D2D2D" if is_dark else "#FFFFFF",
+            "text": "#FFFFFF" if is_dark else "#333333",
+            "border": "#404040" if is_dark else "#E5E5EA",
+            "input_bg": "#3A3A3A" if is_dark else "#F2F2F7",
+            "table_head": "#333333" if is_dark else "#E5E5EA",
+        }
+
+        style = f"""
+            QMainWindow, QWidget {{ background-color: {c["bg"]}; color: {c["text"]}; font-family: "Microsoft YaHei", sans-serif; }}
+            
+            QFrame#SidePanel, QFrame#FilterBox {{ 
+                background-color: {c["panel"]}; 
+                border-radius: 12px; 
+                border: 1px solid {c["border"]}; 
+            }}
+            
+            QLineEdit, QComboBox, QSpinBox {{
+                background-color: {c["input_bg"]};
+                border: 1px solid {c["border"]};
+                border-radius: 6px;
+                padding: 4px 8px;
+                color: {c["text"]};
+                selection-background-color: #007AFF;
+            }}
+            
+            QPushButton {{
+                background-color: #007AFF; 
+                color: white; 
+                border-radius: 6px; 
+                padding: 6px 12px; 
+                border: none;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ opacity: 0.8; }}
+            QPushButton:pressed {{ opacity: 0.6; }}
+            QPushButton:disabled {{ background-color: {c["border"]}; color: #999; }}
+            QPushButton#QuitBtn {{ background-color: #FF3B30; }}
+            
+            QListWidget {{
+                background-color: {c["panel"]};
+                border: 1px solid {c["border"]};
+                border-radius: 8px;
+                outline: none;
+            }}
+            QListWidget::item {{ height: 28px; padding-left: 5px; }}
+            QListWidget::item:selected {{ background-color: #007AFF; color: white; }}
+            
+            QTableWidget {{
+                background-color: {c["panel"]};
+                gridline-color: {c["border"]};
+                border: 1px solid {c["border"]};
+                border-radius: 8px;
+                selection-background-color: #B3D7FF;
+                selection-color: black;
+            }}
+            QHeaderView::section {{
+                background-color: {c["table_head"]};
+                padding: 5px;
+                border: none;
+                font-weight: bold;
+                border-right: 1px solid {c["border"]};
+                border-bottom: 1px solid {c["border"]};
+            }}
+            QScrollBar:vertical {{ width: 10px; background: transparent; }}
+            QScrollBar::handle:vertical {{ background: #999; border-radius: 5px; }}
+        """
+        self.setStyleSheet(style)
+        
+        buttons = self.findChildren(QPushButton)
+        for btn in buttons:
+            base_color = btn.property("base_color")
+            if base_color:
+                btn.setStyleSheet(f"background-color: {base_color}; color: white; border-radius: 6px; padding: 6px;")
 
     def update_preview(self):
         if self.file_list.count() == 0: self.preview_label.setPixmap(QPixmap()); return
@@ -401,7 +653,7 @@ class ZZPrinterApp(QMainWindow):
         self.engine.create_layout(paths, self.layout_combo.currentText(), "pre.pdf", self.copy_spin.value())
         try:
             doc = fitz.open("pre.pdf")
-            pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+            pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.0, 1.0))
             img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
             self.preview_label.setPixmap(QPixmap.fromImage(img).scaledToWidth(self.scroll_area.width()-30, Qt.TransformationMode.SmoothTransformation))
             doc.close()
@@ -417,7 +669,7 @@ class ZZPrinterApp(QMainWindow):
         for i in self.file_list.selectedItems(): self.file_list.takeItem(self.file_list.row(i))
         self.update_preview()
     def clear_all(self): self.file_list.clear(); self.update_preview()
-    def reset_filters(self): self.search_seller.clear(); self.search_date.clear(); self.search_proc_date.clear(); self.refresh_table()
+    def reset_filters(self): self.search_seller.clear(); self.search_date.clear(); self.refresh_table()
     def dragEnterEvent(self, e): e.accept() if e.mimeData().hasUrls() else e.ignore()
     def dropEvent(self, e): self.handle_files([u.toLocalFile() for u in e.mimeData().urls()])
 
